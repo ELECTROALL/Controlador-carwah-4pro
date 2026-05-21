@@ -1,0 +1,366 @@
+#include <SPI.h>
+#include <EEPROM.h>
+
+// =======================
+// MAX7219
+// =======================
+const int PIN_LOAD = 10;
+const int PIN_CLK  = 13;
+const int PIN_DIN  = 11;
+
+// =======================
+// ENTRADAS
+// =======================
+const int PUL_PRODUCTO = 4;
+const int STOP_PAUSA   = 3;
+const int COIN_ACEP    = 2;
+
+// =======================
+// SALIDA BOMBA
+// =======================
+const int BOMBA = 17;   // Activa en LOW
+
+// =======================
+// VARIABLES
+// =======================
+volatile int coinPulseCount = 0;
+unsigned long lastCoinPulseTime = 0;
+
+float saldo = 0;
+
+bool dispensando = false;
+bool pausado = false;
+
+unsigned long tiempoInicio = 0;
+unsigned long tiempoRestante = 0;
+unsigned long tiempoPausado = 0;
+
+// Tiempo por sol
+int tiempoPorSol = 120;
+
+// EEPROM
+const int addrTiempo = 0;
+
+// =======================
+// PROTOTIPOS
+// =======================
+void initMAX7219();
+void writeMAX7219(byte address, byte data);
+void clearDisplay();
+
+void coinInterrupt();
+void stopInterrupt();
+
+void procesarMonedas();
+
+void iniciarDispensado();
+void detenerDispensado();
+void pausarReanudar();
+
+void actualizarTiempo();
+
+void displayTiempoSaldo(unsigned long segundos, float saldoActual);
+
+byte numberTo7Segment(int number);
+
+// =========================================================
+// SETUP
+// =========================================================
+void setup() {
+
+  pinMode(PIN_LOAD, OUTPUT);
+  pinMode(PIN_CLK, OUTPUT);
+  pinMode(PIN_DIN, OUTPUT);
+
+  pinMode(PUL_PRODUCTO, INPUT);
+  pinMode(STOP_PAUSA, INPUT);
+  pinMode(COIN_ACEP, INPUT);
+
+  pinMode(BOMBA, OUTPUT);
+  digitalWrite(BOMBA, HIGH);
+
+  attachInterrupt(digitalPinToInterrupt(COIN_ACEP), coinInterrupt, FALLING);
+  attachInterrupt(digitalPinToInterrupt(STOP_PAUSA), stopInterrupt, FALLING);
+
+  SPI.begin();
+
+  initMAX7219();
+  clearDisplay();
+
+  EEPROM.get(addrTiempo, tiempoPorSol);
+
+  if (tiempoPorSol <= 0 || tiempoPorSol > 999) {
+    tiempoPorSol = 120;
+    EEPROM.put(addrTiempo, tiempoPorSol);
+  }
+
+  displayTiempoSaldo(0, 0);
+}
+
+// =========================================================
+// LOOP
+// =========================================================
+void loop() {
+
+  procesarMonedas();
+
+  // Botón producto
+  if (digitalRead(PUL_PRODUCTO) == LOW) {
+
+    if (!dispensando && saldo >= 1) {
+      iniciarDispensado();
+      delay(300);
+    }
+  }
+
+  if (dispensando && !pausado) {
+    actualizarTiempo();
+  }
+
+  delay(10);
+}
+
+// =========================================================
+// INTERRUPCION MONEDAS
+// =========================================================
+void coinInterrupt() {
+
+  static unsigned long lastInterrupt = 0;
+
+  if (millis() - lastInterrupt > 50) {
+
+    coinPulseCount++;
+    lastCoinPulseTime = millis();
+  }
+
+  lastInterrupt = millis();
+}
+
+// =========================================================
+// INTERRUPCION PAUSA
+// =========================================================
+void stopInterrupt() {
+
+  static unsigned long lastInterrupt = 0;
+
+  if (millis() - lastInterrupt > 200) {
+
+    if (dispensando) {
+      pausarReanudar();
+    }
+  }
+
+  lastInterrupt = millis();
+}
+
+// =========================================================
+// PROCESAR MONEDAS
+// =========================================================
+void procesarMonedas() {
+
+  if (coinPulseCount > 0 &&
+      millis() - lastCoinPulseTime > 20) {
+
+    saldo += coinPulseCount;
+
+    // Si ya está dispensando agrega tiempo
+    if (dispensando) {
+
+      unsigned long extra =
+        coinPulseCount * tiempoPorSol;
+
+      tiempoRestante += extra;
+
+      if (pausado) {
+        tiempoPausado += extra;
+      }
+    }
+
+    coinPulseCount = 0;
+
+    if (dispensando) {
+
+      if (pausado) {
+        displayTiempoSaldo(tiempoPausado, saldo);
+      }
+      else {
+        displayTiempoSaldo(tiempoRestante, saldo);
+      }
+    }
+    else {
+      displayTiempoSaldo(0, saldo);
+    }
+  }
+}
+
+// =========================================================
+// INICIAR
+// =========================================================
+void iniciarDispensado() {
+
+  tiempoRestante = saldo * tiempoPorSol;
+
+  tiempoInicio = millis();
+
+  dispensando = true;
+  pausado = false;
+
+  digitalWrite(BOMBA, LOW);
+
+  displayTiempoSaldo(tiempoRestante, saldo);
+}
+
+// =========================================================
+// DETENER
+// =========================================================
+void detenerDispensado() {
+
+  dispensando = false;
+  pausado = false;
+
+  saldo = 0;
+
+  tiempoRestante = 0;
+  tiempoPausado = 0;
+
+  digitalWrite(BOMBA, HIGH);
+
+  displayTiempoSaldo(0, 0);
+}
+
+// =========================================================
+// PAUSAR / REANUDAR
+// =========================================================
+void pausarReanudar() {
+
+  if (!pausado) {
+
+    pausado = true;
+
+    unsigned long transcurrido =
+      (millis() - tiempoInicio) / 1000;
+
+    tiempoPausado =
+      tiempoRestante - transcurrido;
+
+    digitalWrite(BOMBA, HIGH);
+  }
+  else {
+
+    pausado = false;
+
+    tiempoInicio =
+      millis() -
+      ((tiempoRestante - tiempoPausado) * 1000);
+
+    digitalWrite(BOMBA, LOW);
+  }
+}
+
+// =========================================================
+// ACTUALIZAR TIEMPO
+// =========================================================
+void actualizarTiempo() {
+
+  unsigned long transcurrido =
+    (millis() - tiempoInicio) / 1000;
+
+  if (transcurrido >= tiempoRestante) {
+
+    detenerDispensado();
+  }
+  else {
+
+    unsigned long restante =
+      tiempoRestante - transcurrido;
+
+    displayTiempoSaldo(restante, saldo);
+  }
+}
+
+// =========================================================
+// DISPLAY
+// =========================================================
+void displayTiempoSaldo(unsigned long segundos,
+                        float saldoActual) {
+
+  int minutos = segundos / 60;
+  int seg     = segundos % 60;
+
+  int saldoInt = (int)saldoActual;
+
+  int d1 = minutos / 10;
+  int d2 = minutos % 10;
+
+  int d3 = seg / 10;
+  int d4 = seg % 10;
+
+  int d5 = saldoInt / 10;
+  int d6 = saldoInt % 10;
+
+  writeMAX7219(1, numberTo7Segment(d1));
+  writeMAX7219(2, numberTo7Segment(d2) | 0x80);
+
+  writeMAX7219(3, numberTo7Segment(d3));
+  writeMAX7219(4, numberTo7Segment(d4));
+
+  writeMAX7219(5, numberTo7Segment(d5));
+  writeMAX7219(6, numberTo7Segment(d6));
+
+  writeMAX7219(7, 0x00);
+  writeMAX7219(8, 0x00);
+}
+
+// =========================================================
+// MAX7219
+// =========================================================
+void initMAX7219() {
+
+  writeMAX7219(0x0F, 0x00);
+  writeMAX7219(0x0A, 0x08);
+  writeMAX7219(0x0B, 0x07);
+  writeMAX7219(0x0C, 0x01);
+  writeMAX7219(0x09, 0x00);
+}
+
+void writeMAX7219(byte address, byte data) {
+
+  digitalWrite(PIN_LOAD, LOW);
+
+  SPI.transfer(address);
+  SPI.transfer(data);
+
+  digitalWrite(PIN_LOAD, HIGH);
+}
+
+void clearDisplay() {
+
+  for (int i = 1; i <= 8; i++) {
+    writeMAX7219(i, 0x00);
+  }
+}
+
+// =========================================================
+// 7 SEGMENTOS
+// =========================================================
+byte numberTo7Segment(int number) {
+
+  byte patterns[] = {
+    0x7E, //0
+    0x30, //1
+    0x6D, //2
+    0x79, //3
+    0x33, //4
+    0x5B, //5
+    0x5F, //6
+    0x70, //7
+    0x7F, //8
+    0x7B  //9
+  };
+
+  if (number >= 0 && number <= 9) {
+    return patterns[number];
+  }
+
+  return 0x00;
+}
